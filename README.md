@@ -28,6 +28,11 @@ For full localized docs, use:
   }
 }
 ```
+Just npx:
+
+```bash
+npx -y github:MotyaDev/RustcratiCode
+```
 
 ### 3) Restart host and index project
 
