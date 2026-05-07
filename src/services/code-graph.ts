@@ -5,6 +5,7 @@ import fs from "node:fs/promises";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { Lang, registerDynamicLanguage } from "@ast-grep/napi";
+import { glob } from "glob";
 import { graphCollectionName, projectIdFromPath } from "../config.js";
 import { EXTRA_EXTENSIONS, getLanguageFromExtension, MAX_GRAPH_FILE_BYTES } from "../constants.js";
 import type {
@@ -12,7 +13,7 @@ import type {
   SymbolEdge, SymbolGraphFilePayload, SymbolGraphMeta, SymbolNode, SymbolRef,
 } from "../types.js";
 import { loadPathAliases } from "./graph-aliases.js";
-import { extractImports } from "./graph-imports.js";
+import { extractImports, type ImportInfo } from "./graph-imports.js";
 import { buildCsNamespaceMap, buildGoModuleInfo, buildJvmSuffixMap, resolveImport } from "./graph-resolution.js";
 import { computeUnresolvedPct, resolveCallSites } from "./graph-symbol-resolution.js";
 import { extractSymbolsAndCalls, rawCallsToUnresolvedEdges } from "./graph-symbols.js";
@@ -256,28 +257,43 @@ async function persistSymbolGraph(
   await ensureSymbolGraphCollections(projectId);
 
   // Build per-file payloads (need source bytes for contentHash).
-  const payloads: SymbolGraphFilePayload[] = [];
+  const payloads = await Promise.all(
+    Array.from(symbolsByFile.entries()).map(async ([relPath, symbols]) => {
+      const outgoingCalls = outgoingCallsByFile.get(relPath) ?? [];
+      let language = "plaintext";
+      const firstNonModule = symbols.find((s) => s.name !== "<module>");
+      if (firstNonModule) language = firstNonModule.language;
+      else language = symbols[0]?.language ?? language;
+
+      let contentHash = "";
+      try {
+        const src = await fs.readFile(path.join(resolvedPath, relPath), "utf-8");
+        contentHash = contentHashOf(src);
+      } catch {
+        // ignore
+      }
+
+      return {
+        payload: {
+          file: relPath,
+          language,
+          contentHash,
+          symbols,
+          outgoingCalls,
+        } satisfies SymbolGraphFilePayload,
+        symbolCount: symbols.filter((s) => s.name !== "<module>").length,
+        edgeCount: outgoingCalls.length,
+      };
+    }),
+  );
+
   let totalSymbols = 0;
   let totalEdges = 0;
-  for (const [relPath, symbols] of symbolsByFile.entries()) {
-    const outgoingCalls = outgoingCallsByFile.get(relPath) ?? [];
-    let language = "plaintext";
-    const firstNonModule = symbols.find((s) => s.name !== "<module>");
-    if (firstNonModule) language = firstNonModule.language;
-    else language = symbols[0]?.language ?? language;
-
-    let contentHash = "";
-    try {
-      const src = await fs.readFile(path.join(resolvedPath, relPath), "utf-8");
-      contentHash = contentHashOf(src);
-    } catch {
-      // ignore
-    }
-    payloads.push({
-      file: relPath, language, contentHash, symbols, outgoingCalls,
-    });
-    totalSymbols += symbols.filter((s) => s.name !== "<module>").length;
-    totalEdges += outgoingCalls.length;
+  const filePayloads: SymbolGraphFilePayload[] = [];
+  for (const item of payloads) {
+    filePayloads.push(item.payload);
+    totalSymbols += item.symbolCount;
+    totalEdges += item.edgeCount;
   }
 
   // Build sharded indices
@@ -321,7 +337,7 @@ async function persistSymbolGraph(
   }
 
   // Persist
-  await saveFilePayloads(projectId, payloads);
+  await saveFilePayloads(projectId, filePayloads);
   for (const [shardKey, shard] of nameShards.entries()) {
     if (Object.keys(shard).length === 0) continue;
     await saveNameShard(projectId, shardKey, shard);
@@ -574,6 +590,19 @@ export function getAstGrepLang(ext: string): Lang | string | null {
 
 // ── Graph building ───────────────────────────────────────────────────────
 
+/** Number of files to parse per graph-analysis batch (I/O + AST parsing). */
+const GRAPH_ANALYZE_BATCH: number = (() => {
+  const raw = process.env.GRAPH_ANALYZE_BATCH_SIZE;
+  if (raw === undefined) return 50;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      `Invalid GRAPH_ANALYZE_BATCH_SIZE: "${raw}". Must be a positive integer.`,
+    );
+  }
+  return parsed;
+})();
+
 /**
  * Get all source files in a project for graph analysis.
  * Includes files with known AST grammars and any extra extensions.
@@ -584,36 +613,19 @@ async function getGraphableFiles(
 ): Promise<string[]> {
   const ig = createIgnoreFilter(projectPath);
   const extras = extraExts ?? EXTRA_EXTENSIONS;
-  const files: string[] = [];
 
-  async function walk(dir: string): Promise<void> {
-    let entries: import("node:fs").Dirent[];
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
+  const allFiles = await glob("**/*", {
+    cwd: projectPath,
+    nodir: true,
+    dot: (process.env.INCLUDE_DOT_FILES ?? "false").toLowerCase() === "true",
+    absolute: false,
+  });
 
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      const relPath = path.relative(projectPath, fullPath);
-
-      if (shouldIgnore(ig, relPath)) continue;
-
-      if (entry.isDirectory()) {
-        await walk(fullPath);
-      } else if (entry.isFile()) {
-        const ext = path.extname(entry.name).toLowerCase();
-        // Include if AST grammar is available OR if it's an extra extension
-        if (getAstGrepLang(ext) !== null || extras.has(ext)) {
-          files.push(relPath);
-        }
-      }
-    }
-  }
-
-  await walk(projectPath);
-  return files;
+  return allFiles.filter((relativePath) => {
+    if (shouldIgnore(ig, relativePath)) return false;
+    const ext = path.extname(relativePath).toLowerCase();
+    return getAstGrepLang(ext) !== null || extras.has(ext);
+  });
 }
 
 /**
@@ -676,102 +688,173 @@ export async function buildCodeGraph(
   const hasGo = files.some((f) => f.endsWith(".go"));
   const goModuleInfo = hasGo ? buildGoModuleInfo(fileSet, resolvedPath) : undefined;
 
-  for (const relPath of files) {
-    const ext = path.extname(relPath).toLowerCase();
-    const lang = getAstGrepLang(ext);
+  interface FileAnalysis {
+    relPath: string;
+    absolutePath: string;
+    language: string;
+    importInfos: ImportInfo[];
+    symbols: SymbolNode[] | null;
+    outgoingCalls: SymbolEdge[] | null;
+    isLeaf: boolean;
+    skipped: boolean;
+  }
 
-    // Files with no AST grammar (extra extensions) are included as leaf nodes
-    // so they can be targets of import edges from other files, but we skip
-    // import extraction since we can't parse them.
-    if (!lang) {
-      const absolutePath = path.join(resolvedPath, relPath);
-      if (!nodesMap.has(relPath)) {
-        nodesMap.set(relPath, {
-          filePath: absolutePath,
-          relativePath: relPath,
+  for (let i = 0; i < files.length; i += GRAPH_ANALYZE_BATCH) {
+    const batch = files.slice(i, i + GRAPH_ANALYZE_BATCH);
+    const results = await Promise.all(
+      batch.map(async (relPath): Promise<FileAnalysis> => {
+        const ext = path.extname(relPath).toLowerCase();
+        const lang = getAstGrepLang(ext);
+        const absolutePath = path.join(resolvedPath, relPath);
+
+        // Files with no AST grammar (extra extensions) are included as leaf nodes
+        // so they can be targets of import edges from other files, but we skip
+        // import extraction since we can't parse them.
+        if (!lang) {
+          return {
+            relPath,
+            absolutePath,
+            language: getLanguageFromExtension(ext),
+            importInfos: [],
+            symbols: null,
+            outgoingCalls: null,
+            isLeaf: true,
+            skipped: false,
+          };
+        }
+
+        const language = getLanguageFromExtension(ext);
+
+        let source: string;
+        try {
+          const stat = await fs.stat(absolutePath);
+          if (stat.size > MAX_GRAPH_FILE_BYTES) {
+            return {
+              relPath,
+              absolutePath,
+              language,
+              importInfos: [],
+              symbols: null,
+              outgoingCalls: null,
+              isLeaf: false,
+              skipped: true,
+            };
+          }
+          source = await fs.readFile(absolutePath, "utf-8");
+        } catch {
+          return {
+            relPath,
+            absolutePath,
+            language,
+            importInfos: [],
+            symbols: null,
+            outgoingCalls: null,
+            isLeaf: false,
+            skipped: true,
+          };
+        }
+
+        const importInfos = extractImports(source, lang, ext);
+
+        try {
+          const extracted = extractSymbolsAndCalls(source, lang, ext, relPath);
+          return {
+            relPath,
+            absolutePath,
+            language,
+            importInfos,
+            symbols: extracted.symbols,
+            outgoingCalls: rawCallsToUnresolvedEdges(extracted.rawCalls),
+            isLeaf: false,
+            skipped: false,
+          };
+        } catch (err) {
+          logger.debug("Symbol extraction failed (continuing)", {
+            file: relPath,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return {
+            relPath,
+            absolutePath,
+            language,
+            importInfos,
+            symbols: null,
+            outgoingCalls: null,
+            isLeaf: false,
+            skipped: false,
+          };
+        }
+      }),
+    );
+
+    for (const result of results) {
+      if (result.skipped) continue;
+
+      if (!nodesMap.has(result.relPath)) {
+        nodesMap.set(result.relPath, {
+          filePath: result.absolutePath,
+          relativePath: result.relPath,
           imports: [],
           exports: [],
           dependencies: [],
           dependents: [],
         });
       }
-      if (progress) progress.filesProcessed++;
-      continue;
-    }
+      const node = nodesMap.get(result.relPath);
+      if (!node) continue;
 
-    const language = getLanguageFromExtension(ext);
-    const absolutePath = path.join(resolvedPath, relPath);
+      if (result.symbols && result.outgoingCalls) {
+        symbolsByFile.set(result.relPath, result.symbols);
+        outgoingCallsByFile.set(result.relPath, result.outgoingCalls);
+      }
 
-    let source: string;
-    try {
-      const stat = await fs.stat(absolutePath);
-      if (stat.size > MAX_GRAPH_FILE_BYTES) continue; // Skip large files
-      source = await fs.readFile(absolutePath, "utf-8");
-    } catch {
-      continue;
-    }
+      if (result.isLeaf) continue;
 
-    // Create node for this file
-    if (!nodesMap.has(relPath)) {
-      nodesMap.set(relPath, {
-        filePath: absolutePath,
-        relativePath: relPath,
-        imports: [],
-        exports: [],
-        dependencies: [],
-        dependents: [],
-      });
-    }
-    const node = nodesMap.get(relPath);
-    if (!node) continue;
+      for (const imp of result.importInfos) {
+        node.imports.push(imp.moduleSpecifier);
 
-    // Extract imports using ast-grep
-    const importInfos = extractImports(source, lang, ext);
+        // Try to resolve to a project file
+        // CSS imports from <style> blocks use CSS resolution even when the source file is Svelte/Vue
+        const resolutionLanguage = imp.isCssImport ? "css" : result.language;
+        const resolved = resolveImport(
+          imp.moduleSpecifier,
+          result.absolutePath,
+          resolvedPath,
+          fileSet,
+          resolutionLanguage,
+          aliases,
+          jvmSuffixMap,
+          csNamespaceMap,
+          goModuleInfo,
+        );
+        if (resolved) {
+          node.dependencies.push(resolved);
 
-    // Extract symbols & raw call sites in the same pass
-    try {
-      const extracted = extractSymbolsAndCalls(source, lang, ext, relPath);
-      symbolsByFile.set(relPath, extracted.symbols);
-      outgoingCallsByFile.set(relPath, rawCallsToUnresolvedEdges(extracted.rawCalls));
-    } catch (err) {
-      logger.debug("Symbol extraction failed (continuing)", {
-        file: relPath,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
+          // Ensure target node exists
+          if (!nodesMap.has(resolved)) {
+            nodesMap.set(resolved, {
+              filePath: path.join(resolvedPath, resolved),
+              relativePath: resolved,
+              imports: [],
+              exports: [],
+              dependencies: [],
+              dependents: [],
+            });
+          }
+          nodesMap.get(resolved)?.dependents.push(result.relPath);
 
-    for (const imp of importInfos) {
-      node.imports.push(imp.moduleSpecifier);
-
-      // Try to resolve to a project file
-      // CSS imports from <style> blocks use CSS resolution even when the source file is Svelte/Vue
-      const resolutionLanguage = imp.isCssImport ? "css" : language;
-      const resolved = resolveImport(imp.moduleSpecifier, absolutePath, resolvedPath, fileSet, resolutionLanguage, aliases, jvmSuffixMap, csNamespaceMap, goModuleInfo);
-      if (resolved) {
-        node.dependencies.push(resolved);
-
-        // Ensure target node exists
-        if (!nodesMap.has(resolved)) {
-          nodesMap.set(resolved, {
-            filePath: path.join(resolvedPath, resolved),
-            relativePath: resolved,
-            imports: [],
-            exports: [],
-            dependencies: [],
-            dependents: [],
+          edges.push({
+            source: result.relPath,
+            target: resolved,
+            type: imp.isDynamic ? "dynamic-import" : "import",
           });
         }
-        nodesMap.get(resolved)?.dependents.push(relPath);
-
-        edges.push({
-          source: relPath,
-          target: resolved,
-          type: imp.isDynamic ? "dynamic-import" : "import",
-        });
       }
     }
 
-    if (progress) progress.filesProcessed++;
+    if (progress) {
+      progress.filesProcessed = Math.min(i + batch.length, files.length);
+    }
   }
 
   logger.info("Code graph built", { nodes: nodesMap.size, edges: edges.length });

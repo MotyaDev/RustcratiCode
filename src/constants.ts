@@ -9,10 +9,10 @@ const pkg = esmRequire("../package.json") as { version: string };
 export const SOCRATICODE_VERSION: string = pkg.version;
 
 // ── Embedding configuration ──────────────────────────────────────────────
-// Embedding model and dimensions are now configured via environment variables.
-// See src/services/embedding-config.ts for OLLAMA_MODE, OLLAMA_URL,
-// EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, and OLLAMA_API_KEY.
-// Defaults: nomic-embed-text with 768 dimensions via Docker Ollama on :11435.
+// Embedding model and dimensions are configured via environment variables.
+// See src/services/embedding-config.ts for EMBEDDING_PRESET, OLLAMA_MODE,
+// OLLAMA_URL, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS, and OLLAMA_API_KEY.
+// Defaults: ollama + EMBEDDING_PRESET=default -> nomic-embed-text (768 dims).
 
 // ── Qdrant configuration ────────────────────────────────────────────────
 

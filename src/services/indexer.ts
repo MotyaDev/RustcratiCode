@@ -39,7 +39,19 @@ import {
 import { updateChangedFilesSymbolGraph } from "./symbol-graph-incremental.js";
 import { loadSymbolGraphMeta } from "./symbol-graph-store.js";
 
-const FILE_SCAN_BATCH = 50; // Number of files to scan/chunk in parallel (I/O only, no network)
+// Number of files to scan/chunk in parallel (I/O only, no network).
+// Tunable for large monorepos or low-memory machines.
+const FILE_SCAN_BATCH: number = (() => {
+  const raw = process.env.FILE_SCAN_BATCH_SIZE;
+  if (raw === undefined) return 50;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(
+      `Invalid FILE_SCAN_BATCH_SIZE: "${raw}". Must be a positive integer.`,
+    );
+  }
+  return parsed;
+})();
 
 /**
  * Phase F: maximum number of changed/removed files for which the watcher path
