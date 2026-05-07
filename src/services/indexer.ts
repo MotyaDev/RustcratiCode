@@ -13,10 +13,12 @@ import {
   EXTRA_EXTENSIONS,
   getLanguageFromExtension,
   INDEX_BATCH_SIZE,
+  INDEX_MAX_CHUNKS_IN_MEMORY,
   MAX_AVG_LINE_LENGTH,
-  MAX_CHUNK_CHARS,MAX_FILE_BYTES,
+  MAX_CHUNK_CHARS,
+  MAX_FILE_BYTES,
   SPECIAL_FILES,
-  SUPPORTED_EXTENSIONS
+  SUPPORTED_EXTENSIONS,
 } from "../constants.js";
 import type { FileChunk } from "../types.js";
 import { ensureDynamicLanguages, getAstGrepLang, rebuildGraph, removeGraph } from "./code-graph.js";
@@ -725,7 +727,7 @@ export async function indexProject(
     hashes.clear();
   }
 
-  // ── Phase 1: Scan and chunk files ──
+  // ── Phase 1: Scan, chunk, and process changed files in streaming batches ──
   progress.phase = "scanning files";
   const files = await getIndexableFiles(resolvedPath, extraExtensions);
   progress.filesTotal = files.length;
@@ -733,15 +735,154 @@ export async function indexProject(
 
   interface ChunkedFile {
     relativePath: string;
-    absolutePath: string;
     contentHash: string;
     chunks: FileChunk[];
+    existedBefore: boolean;
   }
 
-  const chunkedFiles: ChunkedFile[] = [];
+  const pendingFiles: ChunkedFile[] = [];
+  let pendingChunkCount = 0;
   let skippedCount = 0;
+  let changedCount = 0;
+  let globalChunksProcessed = 0;
+  let totalChunksCreated = 0;
+  let batchNum = 0;
+
+  progress.batchesProcessed = 0;
+  progress.batchesTotal = 0;
+  progress.chunksProcessed = 0;
+  progress.chunksTotal = 0;
+
+  const totalBatchesLabel = () =>
+    progress.batchesTotal && progress.batchesTotal > 0
+      ? String(progress.batchesTotal)
+      : "?";
+
+  const cancelIndexing = () => {
+    const chunksIndexed = totalChunksCreated;
+    onProgress?.(
+      `Indexing cancelled after ${progress.batchesProcessed ?? 0}/${totalBatchesLabel()} batches (${chunksIndexed} chunks saved). Progress is preserved — re-run codebase_index to resume.`,
+    );
+    logger.info("Indexing cancelled by user", {
+      projectPath: resolvedPath,
+      batchesCompleted: progress.batchesProcessed ?? 0,
+      totalBatches: progress.batchesTotal,
+      chunksIndexed,
+    });
+    lastCompleted.set(resolvedPath, {
+      type: "full-index",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated: chunksIndexed,
+      error: "Cancelled by user",
+    });
+    return {
+      filesIndexed: progress.filesProcessed,
+      chunksCreated: chunksIndexed,
+      cancelled: true as const,
+    };
+  };
+
+  const processPendingBatches = async (force: boolean): Promise<boolean> => {
+    while (
+      pendingFiles.length > 0 &&
+      (force ||
+        pendingFiles.length >= INDEX_BATCH_SIZE ||
+        pendingChunkCount >= INDEX_MAX_CHUNKS_IN_MEMORY)
+    ) {
+      if (isCancellationRequested(resolvedPath)) {
+        return true;
+      }
+
+      const batchSize =
+        pendingFiles.length < INDEX_BATCH_SIZE
+          ? pendingFiles.length
+          : INDEX_BATCH_SIZE;
+      const fileBatch = pendingFiles.splice(0, batchSize);
+      const batchChunkCount = fileBatch.reduce((sum, file) => sum + file.chunks.length, 0);
+      pendingChunkCount = Math.max(0, pendingChunkCount - batchChunkCount);
+
+      batchNum++;
+      progress.batchesTotal = batchNum + Math.ceil(pendingFiles.length / INDEX_BATCH_SIZE);
+      const batchTotalLabel = totalBatchesLabel();
+
+      const batchChunkData: Array<{ chunk: FileChunk; contentHash: string }> = [];
+      for (const file of fileBatch) {
+        for (const chunk of file.chunks) {
+          batchChunkData.push({ chunk, contentHash: file.contentHash });
+        }
+      }
+
+      if (batchChunkData.length === 0) {
+        progress.batchesProcessed = batchNum;
+        continue;
+      }
+
+      progress.phase = `generating embeddings (batch ${batchNum}/${batchTotalLabel})`;
+      onProgress?.(
+        `Batch ${batchNum}/${batchTotalLabel}: generating embeddings for ${batchChunkData.length} chunks (${fileBatch.length} files)...`,
+      );
+
+      const batchTexts = batchChunkData.map((c) => prepareDocumentText(c.chunk.content, c.chunk.relativePath));
+      const batchEmbeddings = await generateEmbeddings(batchTexts, (processed) => {
+        progress.chunksProcessed = globalChunksProcessed + processed;
+      });
+      globalChunksProcessed += batchChunkData.length;
+
+      progress.phase = `storing index (batch ${batchNum}/${batchTotalLabel})`;
+      const batchPoints = batchChunkData.map((c, i) => ({
+        id: c.chunk.id,
+        vector: batchEmbeddings[i],
+        bm25Text: batchTexts[i],
+        payload: {
+          filePath: c.chunk.filePath,
+          relativePath: c.chunk.relativePath,
+          content: c.chunk.content,
+          startLine: c.chunk.startLine,
+          endLine: c.chunk.endLine,
+          language: c.chunk.language,
+          type: c.chunk.type,
+          contentHash: c.contentHash,
+        },
+      }));
+
+      const { pointsSkipped } = await upsertPreEmbeddedChunks(collection, batchPoints).catch((err) => {
+        const fileList = fileBatch.map((f) => f.relativePath).join(", ");
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Qdrant upsert failed for batch ${batchNum}/${batchTotalLabel} ` +
+            `(${batchPoints.length} points, collection=${collection}): ${msg}. ` +
+            `Files in batch: ${fileList}`,
+        );
+      });
+
+      if (pointsSkipped > 0 && pointsSkipped === batchPoints.length) {
+        throw new Error(
+          `Qdrant upsert: all ${batchPoints.length} points in batch ${batchNum}/${batchTotalLabel} ` +
+            `were skipped (collection=${collection}). The collection may have been deleted externally.`,
+        );
+      }
+
+      for (const file of fileBatch) {
+        hashes.set(file.relativePath, file.contentHash);
+      }
+      totalChunksCreated += batchChunkData.length;
+
+      progress.phase = `checkpointing (batch ${batchNum}/${batchTotalLabel})`;
+      await saveProjectMetadata(collection, resolvedPath, files.length, hashes.size, hashes, "in-progress");
+      progress.batchesProcessed = batchNum;
+      onProgress?.(`Batch ${batchNum}/${batchTotalLabel} checkpointed (${totalChunksCreated} chunks so far)`);
+    }
+
+    return false;
+  };
 
   for (let i = 0; i < files.length; i += FILE_SCAN_BATCH) {
+    if (isCancellationRequested(resolvedPath)) {
+      return cancelIndexing();
+    }
+
     const batch = files.slice(i, i + FILE_SCAN_BATCH);
     const results = await Promise.all(
       batch.map(async (relativePath): Promise<ChunkedFile | null> => {
@@ -749,158 +890,75 @@ export async function indexProject(
         try {
           const stat = await fsp.stat(absolutePath);
           if (stat.size > MAX_FILE_BYTES) {
-            onProgress?.(`Skipping large file (${(stat.size / 1024 / 1024).toFixed(1)}MB): ${relativePath}`);
+            onProgress?.(
+              `Skipping large file (${(stat.size / 1024 / 1024).toFixed(1)}MB): ${relativePath}`,
+            );
             return null;
           }
+
           const content = await fsp.readFile(absolutePath, "utf-8");
           const contentHash = hashContent(content);
 
-          // Skip unchanged files during re-index
           if (hasExistingData && hashes.get(relativePath) === contentHash) {
             return null;
           }
 
           const chunks = chunkFileContent(absolutePath, relativePath, content);
-          return { relativePath, absolutePath, contentHash, chunks };
+          return {
+            relativePath,
+            contentHash,
+            chunks,
+            existedBefore: hasExistingData && hashes.has(relativePath),
+          };
         } catch {
           return null;
         }
       }),
     );
 
-    for (const r of results) {
-      if (r) chunkedFiles.push(r);
-      else skippedCount++;
+    for (const result of results) {
+      if (!result) {
+        skippedCount++;
+        continue;
+      }
+
+      changedCount++;
+      if (result.existedBefore) {
+        progress.phase = "cleaning stale chunks";
+        await deleteFileChunks(collection, result.relativePath);
+      }
+
+      pendingFiles.push(result);
+      pendingChunkCount += result.chunks.length;
+      progress.chunksTotal = (progress.chunksTotal ?? 0) + result.chunks.length;
+      progress.batchesTotal = batchNum + Math.ceil(pendingFiles.length / INDEX_BATCH_SIZE);
     }
+
     progress.filesProcessed = Math.min(i + batch.length, files.length);
+
+    const cancelled = await processPendingBatches(false);
+    if (cancelled) {
+      return cancelIndexing();
+    }
   }
 
   if (hasExistingData) {
-    onProgress?.(`${chunkedFiles.length} files changed, ${skippedCount} unchanged/skipped`);
+    onProgress?.(`${changedCount} files changed, ${skippedCount} unchanged/skipped`);
 
-    // Delete old chunks for changed files
-    progress.phase = "cleaning stale chunks";
-    for (const file of chunkedFiles) {
-      if (hashes.has(file.relativePath)) {
-        await deleteFileChunks(collection, file.relativePath);
-      }
-    }
-
-    // Handle deleted files
     const currentFileSet = new Set(files);
     for (const [filePath] of hashes) {
       if (!currentFileSet.has(filePath)) {
+        progress.phase = "cleaning stale chunks";
         await deleteFileChunks(collection, filePath);
         hashes.delete(filePath);
       }
     }
   }
 
-  // ── Phase 2 & 3: Process files in batches (embed → upsert → checkpoint) ──
-  const totalBatches = Math.ceil(chunkedFiles.length / INDEX_BATCH_SIZE) || 1;
-  progress.batchesTotal = totalBatches;
-  progress.batchesProcessed = 0;
-
-  // Count total chunks across all batches for progress reporting
-  let totalChunks = 0;
-  for (const file of chunkedFiles) totalChunks += file.chunks.length;
-  progress.chunksTotal = totalChunks;
-  progress.chunksProcessed = 0;
-
-  let globalChunksProcessed = 0;
-  let totalChunksCreated = 0;
-
-  for (let batchIdx = 0; batchIdx < chunkedFiles.length; batchIdx += INDEX_BATCH_SIZE) {
-    // ── Cancellation check: stop gracefully between batches ──
-    if (isCancellationRequested(resolvedPath)) {
-      const chunksIndexed = totalChunksCreated;
-      onProgress?.(`Indexing cancelled after ${progress.batchesProcessed ?? 0}/${totalBatches} batches (${chunksIndexed} chunks saved). Progress is preserved — re-run codebase_index to resume.`);
-      logger.info("Indexing cancelled by user", { projectPath: resolvedPath, batchesCompleted: progress.batchesProcessed ?? 0, totalBatches, chunksIndexed });
-      lastCompleted.set(resolvedPath, {
-        type: "full-index",
-        completedAt: Date.now(),
-        durationMs: Date.now() - progress.startedAt,
-        filesProcessed: progress.filesProcessed,
-        chunksCreated: chunksIndexed,
-        error: "Cancelled by user",
-      });
-      return { filesIndexed: progress.filesProcessed, chunksCreated: chunksIndexed, cancelled: true };
-    }
-
-    const fileBatch = chunkedFiles.slice(batchIdx, batchIdx + INDEX_BATCH_SIZE);
-    const batchNum = Math.floor(batchIdx / INDEX_BATCH_SIZE) + 1;
-
-    // Collect chunks for this file batch
-    const batchChunkData: Array<{ chunk: FileChunk; contentHash: string; absolutePath: string }> = [];
-    for (const file of fileBatch) {
-      for (const chunk of file.chunks) {
-        batchChunkData.push({ chunk, contentHash: file.contentHash, absolutePath: file.absolutePath });
-      }
-    }
-
-    if (batchChunkData.length === 0) {
-      progress.batchesProcessed = batchNum;
-      continue;
-    }
-
-    // Generate embeddings for this batch
-    progress.phase = `generating embeddings (batch ${batchNum}/${totalBatches})`;
-    onProgress?.(`Batch ${batchNum}/${totalBatches}: generating embeddings for ${batchChunkData.length} chunks (${fileBatch.length} files)...`);
-
-    const batchTexts = batchChunkData.map((c) => prepareDocumentText(c.chunk.content, c.chunk.relativePath));
-    const batchEmbeddings = await generateEmbeddings(batchTexts, (processed) => {
-      progress.chunksProcessed = globalChunksProcessed + processed;
-    });
-    globalChunksProcessed += batchChunkData.length;
-
-    // Upsert this batch to Qdrant
-    progress.phase = `storing index (batch ${batchNum}/${totalBatches})`;
-    const batchPoints = batchChunkData.map((c, i) => ({
-      id: c.chunk.id,
-      vector: batchEmbeddings[i],
-      bm25Text: batchTexts[i],
-      payload: {
-        filePath: c.chunk.filePath,
-        relativePath: c.chunk.relativePath,
-        content: c.chunk.content,
-        startLine: c.chunk.startLine,
-        endLine: c.chunk.endLine,
-        language: c.chunk.language,
-        type: c.chunk.type,
-        contentHash: c.contentHash,
-      },
-    }));
-
-    const { pointsSkipped } = await upsertPreEmbeddedChunks(collection, batchPoints).catch((err) => {
-      // Enrich the error with batch context for debugging
-      const fileList = fileBatch.map((f) => f.relativePath).join(", ");
-      const msg = err instanceof Error ? err.message : String(err);
-      throw new Error(
-        `Qdrant upsert failed for batch ${batchNum}/${totalBatches} ` +
-        `(${batchPoints.length} points, collection=${collection}): ${msg}. ` +
-        `Files in batch: ${fileList}`
-      );
-    });
-
-    if (pointsSkipped > 0 && pointsSkipped === batchPoints.length) {
-      // Every single point in the batch was skipped — the collection likely disappeared
-      throw new Error(
-        `Qdrant upsert: all ${batchPoints.length} points in batch ${batchNum}/${totalBatches} ` +
-        `were skipped (collection=${collection}). The collection may have been deleted externally.`
-      );
-    }
-
-    // Update hashes for this batch's files
-    for (const file of fileBatch) {
-      hashes.set(file.relativePath, file.contentHash);
-    }
-    totalChunksCreated += batchChunkData.length;
-
-    // Checkpoint: persist hashes after each batch so progress survives crashes
-    progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
-    await saveProjectMetadata(collection, resolvedPath, files.length, hashes.size, hashes, "in-progress");
-    progress.batchesProcessed = batchNum;
-    onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${totalChunksCreated} chunks so far)`);
+  progress.batchesTotal = batchNum + Math.ceil(pendingFiles.length / INDEX_BATCH_SIZE);
+  const cancelled = await processPendingBatches(true);
+  if (cancelled) {
+    return cancelIndexing();
   }
 
   const filesIndexed = files.length;
@@ -1036,7 +1094,7 @@ export async function updateProjectIndex(
     return { added: result.filesIndexed, updated: 0, removed: 0, chunksCreated: result.chunksCreated, cancelled: result.cancelled };
   }
 
-  // ── Phase 1: Scan files and identify changes ──
+  // ── Phase 1: Scan, chunk, and process changed files in streaming batches ──
   progress.phase = "scanning for changes";
   const currentFiles = await getIndexableFiles(resolvedPath, extraExtensions);
   progress.filesTotal = currentFiles.length;
@@ -1045,93 +1103,76 @@ export async function updateProjectIndex(
 
   interface ChangedFile {
     relativePath: string;
-    absolutePath: string;
     contentHash: string;
     chunks: FileChunk[];
     isNew: boolean;
   }
 
-  const changedFiles: ChangedFile[] = [];
-
-  for (let i = 0; i < currentFiles.length; i += FILE_SCAN_BATCH) {
-    const batch = currentFiles.slice(i, i + FILE_SCAN_BATCH);
-    const results = await Promise.all(
-      batch.map(async (relativePath): Promise<ChangedFile | null> => {
-        const absolutePath = path.join(resolvedPath, relativePath);
-        try {
-          const stat = await fsp.stat(absolutePath);
-          if (stat.size > MAX_FILE_BYTES) {
-            onProgress?.(`Skipping large file (${(stat.size / 1024 / 1024).toFixed(1)}MB): ${relativePath}`);
-            return null;
-          }
-          const content = await fsp.readFile(absolutePath, "utf-8");
-          const contentHash = hashContent(content);
-          const existingHash = hashes.get(relativePath);
-
-          if (existingHash === contentHash) return null;
-
-          const chunks = chunkFileContent(absolutePath, relativePath, content);
-          return { relativePath, absolutePath, contentHash, chunks, isNew: !existingHash };
-        } catch {
-          return null;
-        }
-      }),
-    );
-
-    changedFiles.push(...results.filter((r): r is ChangedFile => r !== null));
-    progress.filesProcessed = Math.min(i + batch.length, currentFiles.length);
-  }
-
-  const unchangedCount = currentFiles.length - changedFiles.length;
-  onProgress?.(`${changedFiles.length} files changed, ${unchangedCount} unchanged/skipped`);
-
+  const changedRelPaths: string[] = [];
+  const pendingFiles: ChangedFile[] = [];
+  let pendingChunkCount = 0;
+  let skippedCount = 0;
   let added = 0;
   let updated = 0;
   let removed = 0;
   let chunksCreated = 0;
+  let batchNum = 0;
+  let globalChunksProcessed = 0;
 
-  if (changedFiles.length > 0) {
-    // Delete old chunks for updated (not new) files
-    progress.phase = "cleaning stale chunks";
-    for (const file of changedFiles) {
-      if (!file.isNew) {
-        await deleteFileChunks(collection, file.relativePath);
-      }
-    }
+  progress.batchesProcessed = 0;
+  progress.batchesTotal = 0;
+  progress.chunksProcessed = 0;
+  progress.chunksTotal = 0;
 
-    // ── Phase 2 & 3: Process changed files in batches (embed → upsert → checkpoint) ──
-    const totalBatches = Math.ceil(changedFiles.length / INDEX_BATCH_SIZE) || 1;
-    progress.batchesTotal = totalBatches;
-    progress.batchesProcessed = 0;
+  const totalBatchesLabel = () =>
+    progress.batchesTotal && progress.batchesTotal > 0
+      ? String(progress.batchesTotal)
+      : "?";
 
-    // Count total chunks across all batches
-    let totalChunksCount = 0;
-    for (const file of changedFiles) totalChunksCount += file.chunks.length;
-    progress.chunksTotal = totalChunksCount;
-    progress.chunksProcessed = 0;
+  const cancelUpdate = () => {
+    onProgress?.(
+      `Update cancelled after ${progress.batchesProcessed ?? 0}/${totalBatchesLabel()} batches (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_update to resume.`,
+    );
+    logger.info("Incremental update cancelled by user", {
+      projectPath: resolvedPath,
+      batchesCompleted: progress.batchesProcessed ?? 0,
+      totalBatches: progress.batchesTotal,
+      chunksCreated,
+    });
+    lastCompleted.set(resolvedPath, {
+      type: "incremental-update",
+      completedAt: Date.now(),
+      durationMs: Date.now() - progress.startedAt,
+      filesProcessed: progress.filesProcessed,
+      chunksCreated,
+      error: "Cancelled by user",
+    });
+    return { added, updated, removed, chunksCreated, cancelled: true as const };
+  };
 
-    let globalChunksProcessed = 0;
-
-    for (let batchIdx = 0; batchIdx < changedFiles.length; batchIdx += INDEX_BATCH_SIZE) {
-      // ── Cancellation check: stop gracefully between batches ──
+  const processPendingBatches = async (force: boolean): Promise<boolean> => {
+    while (
+      pendingFiles.length > 0 &&
+      (force ||
+        pendingFiles.length >= INDEX_BATCH_SIZE ||
+        pendingChunkCount >= INDEX_MAX_CHUNKS_IN_MEMORY)
+    ) {
       if (isCancellationRequested(resolvedPath)) {
-        onProgress?.(`Update cancelled after ${progress.batchesProcessed ?? 0}/${totalBatches} batches (${chunksCreated} chunks saved). Progress is preserved — re-run codebase_update to resume.`);
-        logger.info("Incremental update cancelled by user", { projectPath: resolvedPath, batchesCompleted: progress.batchesProcessed ?? 0, totalBatches, chunksCreated });
-        lastCompleted.set(resolvedPath, {
-          type: "incremental-update",
-          completedAt: Date.now(),
-          durationMs: Date.now() - progress.startedAt,
-          filesProcessed: progress.filesProcessed,
-          chunksCreated,
-          error: "Cancelled by user",
-        });
-        return { added, updated, removed, chunksCreated, cancelled: true };
+        return true;
       }
 
-      const fileBatch = changedFiles.slice(batchIdx, batchIdx + INDEX_BATCH_SIZE);
-      const batchNum = Math.floor(batchIdx / INDEX_BATCH_SIZE) + 1;
+      const batchSize =
+        pendingFiles.length < INDEX_BATCH_SIZE
+          ? pendingFiles.length
+          : INDEX_BATCH_SIZE;
+      const fileBatch = pendingFiles.splice(0, batchSize);
+      const batchChunkCount = fileBatch.reduce((sum, file) => sum + file.chunks.length, 0);
+      pendingChunkCount = Math.max(0, pendingChunkCount - batchChunkCount);
 
-      // Collect chunks for this file batch
+      batchNum++;
+      progress.batchesTotal = batchNum + Math.ceil(pendingFiles.length / INDEX_BATCH_SIZE);
+      const batchTotalLabel = totalBatchesLabel();
+
       const batchChunkData: Array<{ chunk: FileChunk; contentHash: string }> = [];
       for (const file of fileBatch) {
         for (const chunk of file.chunks) {
@@ -1144,9 +1185,10 @@ export async function updateProjectIndex(
         continue;
       }
 
-      // Generate embeddings for this batch
-      progress.phase = `generating embeddings (batch ${batchNum}/${totalBatches})`;
-      onProgress?.(`Batch ${batchNum}/${totalBatches}: generating embeddings for ${batchChunkData.length} chunks (${fileBatch.length} files changed)...`);
+      progress.phase = `generating embeddings (batch ${batchNum}/${batchTotalLabel})`;
+      onProgress?.(
+        `Batch ${batchNum}/${batchTotalLabel}: generating embeddings for ${batchChunkData.length} chunks (${fileBatch.length} files changed)...`,
+      );
 
       const batchTexts = batchChunkData.map((c) => prepareDocumentText(c.chunk.content, c.chunk.relativePath));
       const batchEmbeddings = await generateEmbeddings(batchTexts, (processed) => {
@@ -1154,8 +1196,7 @@ export async function updateProjectIndex(
       });
       globalChunksProcessed += batchChunkData.length;
 
-      // Upsert this batch to Qdrant
-      progress.phase = `storing index (batch ${batchNum}/${totalBatches})`;
+      progress.phase = `storing index (batch ${batchNum}/${batchTotalLabel})`;
       const batchPoints = batchChunkData.map((c, i) => ({
         id: c.chunk.id,
         vector: batchEmbeddings[i],
@@ -1172,16 +1213,23 @@ export async function updateProjectIndex(
         },
       }));
 
-      const { pointsSkipped } = await upsertPreEmbeddedChunks(collection, batchPoints);
+      const { pointsSkipped } = await upsertPreEmbeddedChunks(collection, batchPoints).catch((err) => {
+        const fileList = fileBatch.map((f) => f.relativePath).join(", ");
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Qdrant upsert failed for batch ${batchNum}/${batchTotalLabel} ` +
+            `(${batchPoints.length} points, collection=${collection}): ${msg}. ` +
+            `Files in batch: ${fileList}`,
+        );
+      });
 
       if (pointsSkipped > 0 && pointsSkipped === batchPoints.length) {
         throw new Error(
-          `Qdrant upsert: all ${batchPoints.length} points in batch ${batchNum}/${totalBatches} ` +
-          `were skipped (collection=${collection}). The collection may have been deleted externally.`
+          `Qdrant upsert: all ${batchPoints.length} points in batch ${batchNum}/${batchTotalLabel} ` +
+            `were skipped (collection=${collection}). The collection may have been deleted externally.`,
         );
       }
 
-      // Update hashes and counts for this batch's files
       for (const file of fileBatch) {
         hashes.set(file.relativePath, file.contentHash);
         if (file.isNew) added++;
@@ -1189,12 +1237,79 @@ export async function updateProjectIndex(
       }
       chunksCreated += batchChunkData.length;
 
-      // Checkpoint: persist hashes after each batch
-      progress.phase = `checkpointing (batch ${batchNum}/${totalBatches})`;
+      progress.phase = `checkpointing (batch ${batchNum}/${batchTotalLabel})`;
       await saveProjectMetadata(collection, resolvedPath, currentFiles.length, hashes.size, hashes, "in-progress");
       progress.batchesProcessed = batchNum;
-      onProgress?.(`Batch ${batchNum}/${totalBatches} checkpointed (${chunksCreated} chunks so far)`);
+      onProgress?.(`Batch ${batchNum}/${batchTotalLabel} checkpointed (${chunksCreated} chunks so far)`);
     }
+
+    return false;
+  };
+
+  for (let i = 0; i < currentFiles.length; i += FILE_SCAN_BATCH) {
+    if (isCancellationRequested(resolvedPath)) {
+      return cancelUpdate();
+    }
+
+    const batch = currentFiles.slice(i, i + FILE_SCAN_BATCH);
+    const results = await Promise.all(
+      batch.map(async (relativePath): Promise<ChangedFile | null> => {
+        const absolutePath = path.join(resolvedPath, relativePath);
+        try {
+          const stat = await fsp.stat(absolutePath);
+          if (stat.size > MAX_FILE_BYTES) {
+            onProgress?.(
+              `Skipping large file (${(stat.size / 1024 / 1024).toFixed(1)}MB): ${relativePath}`,
+            );
+            return null;
+          }
+          const content = await fsp.readFile(absolutePath, "utf-8");
+          const contentHash = hashContent(content);
+          const existingHash = hashes.get(relativePath);
+
+          if (existingHash === contentHash) return null;
+
+          const chunks = chunkFileContent(absolutePath, relativePath, content);
+          return { relativePath, contentHash, chunks, isNew: !existingHash };
+        } catch {
+          return null;
+        }
+      }),
+    );
+
+    for (const result of results) {
+      if (!result) {
+        skippedCount++;
+        continue;
+      }
+
+      changedRelPaths.push(result.relativePath);
+      if (!result.isNew) {
+        progress.phase = "cleaning stale chunks";
+        await deleteFileChunks(collection, result.relativePath);
+      }
+
+      pendingFiles.push(result);
+      pendingChunkCount += result.chunks.length;
+      progress.chunksTotal = (progress.chunksTotal ?? 0) + result.chunks.length;
+      progress.batchesTotal = batchNum + Math.ceil(pendingFiles.length / INDEX_BATCH_SIZE);
+    }
+
+    progress.filesProcessed = Math.min(i + batch.length, currentFiles.length);
+
+    const cancelled = await processPendingBatches(false);
+    if (cancelled) {
+      return cancelUpdate();
+    }
+  }
+
+  const unchangedCount = currentFiles.length - changedRelPaths.length;
+  onProgress?.(`${changedRelPaths.length} files changed, ${unchangedCount} unchanged/skipped`);
+
+  progress.batchesTotal = batchNum + Math.ceil(pendingFiles.length / INDEX_BATCH_SIZE);
+  const cancelled = await processPendingBatches(true);
+  if (cancelled) {
+    return cancelUpdate();
   }
 
   // Check for deleted files
@@ -1224,7 +1339,7 @@ export async function updateProjectIndex(
   if (added > 0 || updated > 0 || removed > 0) {
     progress.phase = "building code graph";
     const projectId = projectIdFromPath(resolvedPath);
-    const totalChanged = changedFiles.length + removedRelPaths.length;
+    const totalChanged = changedRelPaths.length + removedRelPaths.length;
     const meta = await loadSymbolGraphMeta(projectId).catch(() => null);
     const useIncremental = meta !== null && totalChanged <= INCREMENTAL_SYMBOL_THRESHOLD;
 
@@ -1243,7 +1358,7 @@ export async function updateProjectIndex(
             projectId,
             resolvedPath,
             graph,
-            changedFiles.map((f) => f.relativePath),
+            changedRelPaths,
             removedRelPaths,
           );
           if (result.fullRebuildRequired) {

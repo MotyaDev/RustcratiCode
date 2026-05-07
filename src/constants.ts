@@ -91,9 +91,25 @@ export const SEARCH_MIN_SCORE = Math.max(0, Math.min(1,
 
 // ── Chunking configuration ──────────────────────────────────────────────
 
+function parsePositiveIntEnv(name: string, defaultValue: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return defaultValue;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`Invalid ${name}: "${raw}". Must be a positive integer.`);
+  }
+  return parsed;
+}
+
 export const CHUNK_SIZE = 100; // lines per chunk
 export const CHUNK_OVERLAP = 10; // overlap lines between chunks
-export const INDEX_BATCH_SIZE = 50; // files per batch for batched/resumable indexing
+export const INDEX_BATCH_SIZE = parsePositiveIntEnv("INDEX_BATCH_SIZE", 50); // files per batch for batched/resumable indexing
+/**
+ * Maximum number of prepared chunks buffered in RAM before forcing an early
+ * batch flush. Reduces peak memory on large repositories without affecting
+ * indexed content or search quality.
+ */
+export const INDEX_MAX_CHUNKS_IN_MEMORY = parsePositiveIntEnv("INDEX_MAX_CHUNKS_IN_MEMORY", 1200);
 
 /** Maximum file size in bytes. Files larger than this are skipped during indexing.
  *  Default: 5 MB. Override via MAX_FILE_SIZE_MB env var. */
