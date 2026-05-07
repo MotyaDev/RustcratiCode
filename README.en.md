@@ -41,6 +41,17 @@ It indexes your repository locally and gives AI assistants fast code search, dep
 
 On first run, SocratiCode pulls required Docker images and embedding model. This can take a few minutes.
 
+## Resource tuning (CPU/RAM)
+
+You can tune indexing memory/CPU usage without changing search quality:
+
+- `FILE_SCAN_BATCH_SIZE` (default: `50`) — files scanned/chunked concurrently.
+- `INDEX_BATCH_SIZE` (default: `50`) — max files per embed/upsert checkpoint batch.
+- `INDEX_MAX_CHUNKS_IN_MEMORY` (default: `1200`) — chunk buffer cap before forcing an early flush.
+- `EMBEDDING_BATCH_SIZE` (default: `32`) — texts per embedding provider request.
+
+For low-memory machines, reduce these values (for example, `20/20/400/16`).
+
 ## Core MCP tools
 
 | Tool | Purpose |
