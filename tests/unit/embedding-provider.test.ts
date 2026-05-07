@@ -11,6 +11,7 @@ describe("embedding-provider", () => {
     resetEmbeddingConfig();
     resetEmbeddingProvider();
     delete process.env.EMBEDDING_PROVIDER;
+    delete process.env.EMBEDDING_PRESET;
     delete process.env.OLLAMA_MODE;
     delete process.env.OLLAMA_URL;
     delete process.env.EMBEDDING_MODEL;
@@ -83,6 +84,7 @@ describe("OpenAIEmbeddingProvider", () => {
     resetEmbeddingConfig();
     resetEmbeddingProvider();
     delete process.env.EMBEDDING_PROVIDER;
+    delete process.env.EMBEDDING_PRESET;
     delete process.env.OPENAI_API_KEY;
     delete process.env.EMBEDDING_MODEL;
     delete process.env.EMBEDDING_DIMENSIONS;
@@ -117,6 +119,7 @@ describe("GoogleEmbeddingProvider", () => {
     resetEmbeddingConfig();
     resetEmbeddingProvider();
     delete process.env.EMBEDDING_PROVIDER;
+    delete process.env.EMBEDDING_PRESET;
     delete process.env.GOOGLE_API_KEY;
     delete process.env.EMBEDDING_MODEL;
     delete process.env.EMBEDDING_DIMENSIONS;
@@ -151,6 +154,7 @@ describe("LMStudioEmbeddingProvider", () => {
     resetEmbeddingConfig();
     resetEmbeddingProvider();
     delete process.env.EMBEDDING_PROVIDER;
+    delete process.env.EMBEDDING_PRESET;
     delete process.env.EMBEDDING_MODEL;
     delete process.env.EMBEDDING_DIMENSIONS;
     delete process.env.EMBEDDING_CONTEXT_LENGTH;

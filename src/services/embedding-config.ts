@@ -35,9 +35,12 @@
  *                          set this only if you've enabled an API key in LM Studio.
  *
  * Shared:
- *   EMBEDDING_MODEL:       Model name (default depends on provider; required for lmstudio).
+ *   EMBEDDING_PRESET:      "default" (default) or "light".
+ *                          In "light" preset, Ollama defaults switch to all-minilm (384 dims)
+ *                          for faster indexing and lower memory/storage usage.
+ *   EMBEDDING_MODEL:       Model name (default depends on provider/preset; required for lmstudio).
  *   EMBEDDING_DIMENSIONS:  Vector dimensions — must match the model (default depends on
- *                          provider; required for lmstudio).
+ *                          provider/preset; required for lmstudio).
  *   EMBEDDING_CONTEXT_LENGTH: Override context window in tokens (auto-detected for known models).
  */
 
@@ -47,6 +50,7 @@ import { logger } from "./logger.js";
 
 export type EmbeddingProvider = "ollama" | "openai" | "google" | "lmstudio";
 export type OllamaMode = "docker" | "external" | "auto";
+type EmbeddingPreset = "default" | "light";
 
 export interface EmbeddingConfig {
   /** Which embedding backend to use. */
@@ -77,6 +81,21 @@ const PROVIDER_DEFAULTS: Record<EmbeddingProvider, { model: string; dimensions: 
   google:   { model: "gemini-embedding-001",    dimensions: 3072 },
   lmstudio: { model: "",                        dimensions: 0    },
 };
+
+const LIGHT_PRESET_DEFAULTS: Partial<Record<EmbeddingProvider, { model: string; dimensions: number }>> = {
+  ollama: { model: "all-minilm", dimensions: 384 },
+};
+
+function resolveProviderDefaults(
+  provider: EmbeddingProvider,
+  preset: EmbeddingPreset,
+): { model: string; dimensions: number } {
+  if (preset === "light") {
+    const presetDefaults = LIGHT_PRESET_DEFAULTS[provider];
+    if (presetDefaults) return presetDefaults;
+  }
+  return PROVIDER_DEFAULTS[provider];
+}
 
 // ── Ollama mode defaults ──────────────────────────────────────────────────
 
@@ -137,7 +156,15 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
     );
   }
   const embeddingProvider: EmbeddingProvider = rawProvider;
-  const providerDefaults = PROVIDER_DEFAULTS[embeddingProvider];
+
+  const rawPreset = process.env.EMBEDDING_PRESET || "default";
+  if (rawPreset !== "default" && rawPreset !== "light") {
+    throw new Error(
+      `Invalid EMBEDDING_PRESET: "${rawPreset}". Must be "default" or "light".`,
+    );
+  }
+  const embeddingPreset: EmbeddingPreset = rawPreset;
+  const providerDefaults = resolveProviderDefaults(embeddingProvider, embeddingPreset);
 
   // LM Studio has no sensible defaults — model and dimensions vary per loaded model.
   // Fail fast with an actionable message rather than silently sending empty values.
@@ -206,6 +233,7 @@ export function loadEmbeddingConfig(): EmbeddingConfig {
 
   logger.info("Embedding config loaded", {
     embeddingProvider: _config.embeddingProvider,
+    embeddingPreset,
     ...(embeddingProvider === "ollama" ? {
       ollamaMode: _config.ollamaMode,
       ollamaUrl: _config.ollamaUrl,

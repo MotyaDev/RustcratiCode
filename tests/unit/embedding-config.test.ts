@@ -14,6 +14,7 @@ describe("embedding-config", () => {
     resetEmbeddingConfig();
     // Clear all embedding-related env vars
     delete process.env.EMBEDDING_PROVIDER;
+    delete process.env.EMBEDDING_PRESET;
     delete process.env.OLLAMA_MODE;
     delete process.env.OLLAMA_URL;
     delete process.env.EMBEDDING_MODEL;
@@ -93,6 +94,34 @@ describe("embedding-config", () => {
       process.env.OLLAMA_URL = "http://gpu-server:11434";
       const config = loadEmbeddingConfig();
       expect(config.ollamaUrl).toBe("http://gpu-server:11434");
+    });
+  });
+
+  describe("embedding preset", () => {
+    it("uses a lighter Ollama default model in light preset", () => {
+      process.env.EMBEDDING_PRESET = "light";
+      const config = loadEmbeddingConfig();
+      expect(config.embeddingProvider).toBe("ollama");
+      expect(config.embeddingModel).toBe("all-minilm");
+      expect(config.embeddingDimensions).toBe(384);
+      expect(config.embeddingContextLength).toBe(256);
+    });
+
+    it("keeps explicit model and dimensions even in light preset", () => {
+      process.env.EMBEDDING_PRESET = "light";
+      process.env.EMBEDDING_MODEL = "mxbai-embed-large";
+      process.env.EMBEDDING_DIMENSIONS = "1024";
+      const config = loadEmbeddingConfig();
+      expect(config.embeddingModel).toBe("mxbai-embed-large");
+      expect(config.embeddingDimensions).toBe(1024);
+      expect(config.embeddingContextLength).toBe(512);
+    });
+
+    it("throws for invalid EMBEDDING_PRESET", () => {
+      process.env.EMBEDDING_PRESET = "tiny";
+      expect(() => loadEmbeddingConfig()).toThrow(
+        'Invalid EMBEDDING_PRESET: "tiny". Must be "default" or "light".',
+      );
     });
   });
 

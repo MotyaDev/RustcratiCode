@@ -1119,8 +1119,9 @@ The rest of this section documents the variables themselves. Pass them using whi
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `EMBEDDING_PROVIDER` | `ollama` | Embedding backend: `ollama` (local, default), `openai`, `google`, or `lmstudio` |
-| `EMBEDDING_MODEL` | *(per provider)* | Model name. Defaults: `nomic-embed-text` (ollama), `text-embedding-3-small` (openai), `gemini-embedding-001` (google). **Required** for `lmstudio` (no default). |
-| `EMBEDDING_DIMENSIONS` | *(per provider)* | Vector dimensions. Defaults: `768` (ollama), `1536` (openai), `3072` (google). **Required** for `lmstudio` (no default; varies per loaded model). |
+| `EMBEDDING_PRESET` | `default` | Embedding preset: `default` or `light`. `light` switches Ollama defaults to `all-minilm` (384 dims) for faster indexing and lower resource usage. Explicit `EMBEDDING_MODEL` / `EMBEDDING_DIMENSIONS` still win. |
+| `EMBEDDING_MODEL` | *(per provider/preset)* | Model name. Defaults: `nomic-embed-text` (ollama + default preset), `all-minilm` (ollama + light preset), `text-embedding-3-small` (openai), `gemini-embedding-001` (google). **Required** for `lmstudio` (no default). |
+| `EMBEDDING_DIMENSIONS` | *(per provider/preset)* | Vector dimensions. Defaults: `768` (ollama + default preset), `384` (ollama + light preset), `1536` (openai), `3072` (google). **Required** for `lmstudio` (no default; varies per loaded model). |
 | `EMBEDDING_CONTEXT_LENGTH` | *(auto-detected)* | Model context window in tokens. Auto-detected for known models. Set manually for custom or LM Studio models. |
 
 ### Ollama Configuration (when `EMBEDDING_PROVIDER=ollama`)
@@ -1167,6 +1168,8 @@ The rest of this section documents the variables themselves. Pass them using whi
 | `INCLUDE_DOT_FILES` | `false` | Set to `true` to include dot-directories (e.g. `.agent`, `.config`) in indexing. By default, directories and files starting with `.` are excluded. Useful for projects where important code lives in dot-directories. |
 | `EXTRA_EXTENSIONS` | *(none)* | Comma-separated list of additional file extensions to scan (e.g. `.tpl,.blade,.hbs`). Applies to both indexing and code graph. Files with extra extensions are indexed as plaintext and appear as leaf nodes in the code graph. Can also be passed per-operation via the `extraExtensions` tool parameter. |
 | `MAX_FILE_SIZE_MB` | `5` | Maximum file size in MB. Files larger than this are skipped during indexing. Increase for repos with large generated or data files you want indexed. |
+| `FILE_SCAN_BATCH_SIZE` | `50` | Number of files scanned/chunked in parallel during indexing and updates. Increase on high-core machines for faster throughput; decrease on low-memory systems to reduce pressure. |
+| `GRAPH_ANALYZE_BATCH_SIZE` | `50` | Number of files parsed per batch while building the dependency/symbol graph. Higher values can speed up graph builds on SSD + multicore machines; lower values reduce memory spikes. |
 | `SEARCH_DEFAULT_LIMIT` | `10` | Default number of results returned by `codebase_search` (1-50). Each result is a ranked code chunk with file path, line range, and content. Higher values give broader coverage but produce more output. Can still be overridden per-query via the `limit` tool parameter. |
 | `SEARCH_MIN_SCORE` | `0.10` | Minimum RRF (Reciprocal Rank Fusion) score threshold (0-1). Results below this score are filtered out. Helps remove low-relevance noise from search results. Set to `0` to disable filtering (returns all results up to `limit`). Can be overridden per-query via the `minScore` tool parameter. Works together with `limit`: results are first filtered by score, then capped at `limit`. |
 | `SOCRATICODE_PROJECT_ID` | *(none)* | Override the auto-generated project ID. When set, all paths resolve to the same Qdrant collections, allowing multiple directories (e.g. git worktrees of the same repo) to share a single index. Must match `[a-zA-Z0-9_-]+`. Takes precedence over the `projectId` field in `.socraticode.json`. |
@@ -1175,7 +1178,7 @@ The rest of this section documents the variables themselves. Pass them using whi
 | `SOCRATICODE_LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error` |
 | `SOCRATICODE_LOG_FILE` | *(none)* | Absolute path to a log file. When set, all log entries are appended to this file (a session separator is written on each server start). Useful for debugging when the MCP host doesn't surface log notifications. |
 
-> **Important**: If you change `EMBEDDING_PROVIDER`, `EMBEDDING_MODEL`, or `EMBEDDING_DIMENSIONS` after indexing, you must re-index your projects (`codebase_remove` then `codebase_index`) since existing vectors have different dimensions.
+> **Important**: If you change `EMBEDDING_PROVIDER`, `EMBEDDING_PRESET`, `EMBEDDING_MODEL`, or `EMBEDDING_DIMENSIONS` after indexing, you must re-index your projects (`codebase_remove` then `codebase_index`) since existing vectors may have different dimensions.
 
 ## Docker Resources
 
